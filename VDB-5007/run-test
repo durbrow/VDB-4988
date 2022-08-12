@@ -160,9 +160,10 @@ sub fasterq($$) {
     $times{END_PREFETCH_FASTERQ_DUMP} = time if $use_prefetch;
 }
 
+my $s3re = qr{ ^https://([^.]+)\.s3(?:\.[^.]+)\.amazonaws\.com/(.+) };
 sub nativeGet($) {
     local $_ = shift;
-    die "can't make an s3 URL from $_\n" unless qr{ ^https://([^.]+)\.s3(?:\.[^.]+)\.amazonaws\.com/(.+) };
+    die "can't make an s3 URL from $_\n" unless m/$s3re/;
     my $url = "s3://$1/$2";
     my $dir = File::Temp->newdir();
     {
