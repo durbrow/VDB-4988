@@ -157,7 +157,7 @@ sub fasterq($$) {
         $times{END_FASTERQ_DUMP} = time unless $?;
     }
     exit 1 if $?;
-    $times{'prefetch+fasterq-dump End'} = time if $use_prefetch;
+    $times{END_PREFETCH_FASTERQ_DUMP} = time if $use_prefetch;
 }
 
 sub nativeGet($) {
@@ -172,9 +172,9 @@ sub nativeGet($) {
             die "can't exec aws s3 cp: $!";
         }
         waitpid $kid, 0;
-        die "fasterq-dump exited with an error." if $?;
-        $times{END_NATIVE_TOOL} = time;
     }
+    die "can't get $url using cloud native tool!\n" if $?;
+    $times{END_NATIVE_TOOL} = time;
 }
 
 ### Implementation details follow ###

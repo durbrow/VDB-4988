@@ -1,4 +1,4 @@
-FROM ncbi/sratools:3.0.0
+FROM ncbi/sra-tools:3.0.0
 RUN apk --no-cache update \
  && apk --no-cache add --virtual .build-deps perl-app-cpanminus wget make \
  && apk --no-cache add perl aws-cli \
