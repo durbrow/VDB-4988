@@ -161,7 +161,9 @@ sub fasterq($$) {
 }
 
 sub nativeGet($) {
-    my $url = $_[0];
+    local $_ = shift;
+    die "can't make an s3 URL from $_\n" unless qr{ ^https://([^.]+)\.s3(?:\.[^.]+)\.amazonaws\.com/(.+) };
+    my $url = "s3://$1/$2";
     my $dir = File::Temp->newdir();
     {
         local $CWD = $dir;
