@@ -1,0 +1,590 @@
+#!/usr/bin/perl -w
+
+use strict;
+use warnings;
+use IO::File;
+use File::chdir;
+use File::Temp;
+use File::Spec;
+use Cwd;
+use Time::HiRes qw( time );
+use Data::Dumper;
+
+use constant {
+    SDL_LOCATION => 's3',
+    CLOUD_TOOLS => 'aws',
+    START_PREFETCH => 'prefetch Start',
+    END_PREFETCH => 'prefetch End',
+    START_FASTERQ_DUMP => 'fasterq-dump Start',
+    END_FASTERQ_DUMP => 'fasterq-dump End',
+    START_PREFETCH_FASTERQ_DUMP => 'prefetch+fasterq-dump Start',
+    END_PREFETCH_FASTERQ_DUMP => 'prefetch+fasterq-dump End',
+    START_NATIVE_TOOL => 'native tool Start',
+    END_NATIVE_TOOL => 'native tool End',
+};
+
+sub getURL($);
+sub nativeGet($);
+sub prefetch($);
+sub fasterq($$);
+sub loadFile($);
+sub loadArgs;
+sub which($);
+sub threads;
+sub temp_location;
+sub mem_avail;
+sub disk_avail;
+
+sub isSRA($) { $_[0] =~ /^\s*[DES]R[APRSXZ]\d{6,9}(?:\.\d+)?\s*$/i }
+sub isRun($) {($_[0] =~ /^\s*([DES]RR\d{6,9})(?:\.\d+)?\s*$/i) ? uc($1) : undef }
+
+my %times = (
+    'startup' => time,
+    START_PREFETCH => 0,
+    END_PREFETCH => 0,
+    START_FASTERQ_DUMP => 0,
+    END_FASTERQ_DUMP => 0,
+    START_PREFETCH_FASTERQ_DUMP => 0,
+    END_PREFETCH_FASTERQ_DUMP => 0,
+    START_NATIVE_TOOL => 0,
+    END_NATIVE_TOOL => 0,
+);
+
+chomp(my $dataDir = `pwd`); die unless $dataDir;
+my $srapathExe = which('srapath') or die;
+my $prefetchExe = which('prefetch') or die;
+my $fasterqExe = which('fasterq-dump') or die;
+my $nativeTools = which(CLOUD_TOOLS) or die;
+my @defaultRuns = qw{ DRR058709 SRR5909293 };
+my @fromArgv;
+my @fqdParams;
+my $verbose = 1;
+my $dryRun = 0;
+my @usage;
+my $threadCount = threads;
+my $tempdir = temp_location;
+my $mem = mem_avail;
+my $disk = disk_avail('.', 2);
+
+loadArgs @ARGV;
+
+my $runs = @fromArgv ? \@fromArgv : \@defaultRuns;
+
+if ($verbose) {
+    printf("runs: [ %s ]\n", join(' ', @$runs));
+    printf("threads: %u\n", $threadCount);
+    printf("memory: %u\n", $mem);
+    printf("temp: %s\n", $tempdir);
+    printf("temp free space: %s\n", disk_avail($tempdir));
+    printf("output: %s\n", $dataDir);
+    printf("output space: %s\n", $disk);
+}
+exit 0 if $dryRun > 0;
+
+for (@$runs) {
+    my $run = $_;
+    my $url = getURL($run);
+    fasterq(0, $run);
+    fasterq(1, $run);
+    nativeGet($url);
+    # print Dumper($_, $url);
+}
+
+exit 0;
+
+sub getURL($) {
+    my $kid = open(my $pipe, '-|') // die "can't fork: $!";
+
+    if ($kid == 0) {
+        exec { $srapathExe } 'srapath', '--location', SDL_LOCATION, @_;
+        die "can't exec srapath: $!";
+    }
+
+    local $_ = <$pipe> // die "can't read URL from srapath: $!";
+    chomp;
+    waitpid $kid, 0;
+    $_
+}
+
+sub prefetch($) {
+    my @args = (
+          '--location', SDL_LOCATION
+        , '--force', 'ALL'
+        , '--max-size', $disk
+        , '--progress'
+        , $_[0]
+    );
+
+    $times{START_PREFETCH} = time;
+    my $kid = fork // die "can't fork: $!";
+    if ($kid == 0) {
+        exec { $prefetchExe } 'prefetch', @args;
+        die "can't exec prefetch: $!";
+    }
+    waitpid $kid, 0;
+    die "prefetch exited with an error." if $?;
+    $times{END_PREFETCH} = time;
+}
+
+sub fasterq($$) {
+    my ($use_prefetch, $run) = @_;
+    my @args = (
+          '--location', SDL_LOCATION
+        , '--force'
+        , '--split-3'
+        , '--temp', $tempdir
+        , '--threads', $threadCount
+        , '--mem', $mem
+        , '--details'
+        , $run
+    );
+    my $effective = @fqdParams ? \@fqdParams : \@args;
+
+    $times{START_PREFETCH_FASTERQ_DUMP} = time if $use_prefetch;
+
+    my $dir = File::Temp->newdir();
+    {
+        local $CWD = $dir;
+        prefetch $run if $use_prefetch;
+
+        $times{START_FASTERQ_DUMP} = time;
+        my $kid = fork // die "can't fork: $!";
+        if ($kid == 0) {
+            exec { $fasterqExe } 'fasterq-dump', @args;
+            die "can't exec fasterq-dump: $!";
+        }
+        waitpid $kid, 0;
+        $times{END_FASTERQ_DUMP} = time unless $?;
+    }
+    exit 1 if $?;
+    $times{'prefetch+fasterq-dump End'} = time if $use_prefetch;
+}
+
+sub nativeGet($) {
+    my $url = $_[0];
+    my $dir = File::Temp->newdir();
+    {
+        local $CWD = $dir;
+        $times{START_NATIVE_TOOL} = time;
+        my $kid = fork // die "can't fork: $!";
+        if ($kid == 0) {
+            exec { $nativeTools } qw[ aws s3 cp ], $url, './';
+            die "can't exec aws s3 cp: $!";
+        }
+        waitpid $kid, 0;
+        die "fasterq-dump exited with an error." if $?;
+        $times{END_NATIVE_TOOL} = time;
+    }
+}
+
+### Implementation details follow ###
+
+sub loadFile($) {
+    my $fh = shift;
+    while (defined(local $_ = <$fh>)) {
+        push @fromArgv, split(/\s+/);
+    }
+}
+
+sub processFqdParam($) {
+    push @fqdParams, $_[0];
+}
+
+sub help;
+
+sub verbosity {
+    if (/[^-+0-9]/) {
+NEED_VERBOSE_USAGE:
+        push @usage, 'verbose';
+        return;
+    }
+    #                 1      2      3          4
+    while (/^\s*(?:(?:([-+]*)(\d+))|([-+]+))\s*(.*)/) {
+        my ($sgn, $digs);
+        ($sgn, $digs, $_) = ($3 || $1, $2, $4);
+
+        if (length($sgn) == 0) {
+            # overwriting not incrementing
+            $verbose = 0;
+        }
+        elsif (length($digs) > 0) {
+            # move last sign to start of number
+            ($sgn, $digs) = (substr($sgn, 0, -1), substr($sgn, -1).$digs);
+        }
+        $verbose += ($sgn =~ tr/+//);
+        $verbose -= ($sgn =~ tr/-//);
+        $verbose += $digs;
+    }
+}
+
+my @param;
+my %paramIndex;
+my %shortParamIndex;
+my $hcol;
+
+sub formatParam($) {
+    my $p = shift;
+    my $y = ' 'x4;
+
+    if ($p->{'shortName'}) {
+        $y .= join('|', map { "-$_" } split(//, $p->{'shortName'})).'|';
+    }
+    $y .= '--'.$p->{name}.' ';
+    if ((my $a = $p->{'arg'})) {
+        $y .= '<'.($a->{'name'} // 'arg').'> ';
+    }
+    $y .= ' ' while (length($y) % 4 != 0);
+    $y
+}
+
+sub paramHelp($) {
+    local $_;
+    my $p = shift;
+    my $y = formatParam $p;
+
+    $y .= ' ' while (length($y) < $hcol);
+
+    my $lines = 1;
+    my $nl = "\n" . " "x$hcol;
+    if (ref $p->{'help'}) {
+        for (@$p->{'help'}) {
+            $y .= $nl if ($lines++ > 1);
+            $y .= $_;
+        }
+    }
+    else {
+        $y .= $p->{'help'};
+    }
+    if ((my $a = $p->{'arg'})) {
+        if (ref $a->{'help'}) {
+            $y .= $nl.$_ for (@{$a->{'help'}});
+        }
+        elsif ($a->{'help'}) {
+            $y .= $nl.$a->{'help'};
+        }
+    }
+    $y
+}
+
+sub help {
+    print(<<"HELP");
+Usage: $0 [<param> ...] [<file> ...] [<accession> ...] [ -- <fasterq-dump-params> ]
+    <file> should contain a whitespace delimited list of accessions
+        (tabs, spaces, and newlines all work as delimiters).
+HELP
+    if (@defaultRuns) {
+        print("\nIf no file or accession is given, the default accessions will be used:\n");
+        print(join("\n", map { "    $_" } @defaultRuns)."\n");
+    }
+
+    print(<<"HELP");
+
+  Parameters:
+HELP
+    printf("%s\n", paramHelp $_) for (@param);
+}
+
+my $expectingArg;
+my $argsDone;
+
+sub setParams {
+    return if @param;
+
+    @param = (
+        { 'name' => 'help', 'shortName' => 'h?', 'function' => \&help, 'help' => 'Display this help text.' },
+        { 'name' => 'verbose'
+        , 'shortName' => 'v'
+        , 'help' => 'Sets verbosity level.'
+        , 'arg' => {
+            'name' => 'value/increment',
+            'default' => '+1',
+            'invalid' => sub { /[^-+0-9]/ },
+            'help' => [
+                'The argument may be /^\d+|[+-]\d+|[+-]+$/;',
+                'values starting with +/- are incremental.',
+                'The default value is \'+1\'.',
+                'Examples: -v # increase by 1',
+                '          -v 2 # set verbosity to 2',
+                '          -v +2 # add 2',
+                '          -v ++ # same as -v ++',
+                ]
+            }
+        , 'function' => \&verbosity
+        },
+        { 'name' => 'temp', 'shortName' => 't'
+        , 'help' => 'Change default temp directory from \''.$tempdir.'\'.'
+        , 'arg' =>
+            { 'name' => 'path'
+            , 'invalid' => sub { -d ? undef : "$_ is not a directory." }
+            }
+        , 'function' => sub { $tempdir = $_ }
+        },
+    );
+    my %tmp;
+
+    for (@param) {
+        my ($k, $s) = ($_->{'name'}, $_->{'shortName'});
+
+        $paramIndex{$k} = scalar %paramIndex;
+        next unless $s;
+
+        for (split //, $s) {
+            die "duplicate mapping for '-$_'; can't map to both '--$tmp{$_}' and '--$k'\n" if exists($tmp{$_}) && $tmp{$_} ne $k;
+            $tmp{$_} = $k;
+        }
+    }
+    $shortParamIndex{$_} = $paramIndex{$tmp{$_}} for (keys %tmp);
+
+    $hcol = 1;
+    my $val = 0;
+    for (@param) {
+        my $col = length formatParam $_;
+        $val = $col if ($val < $col);
+    }
+    $hcol = $val;
+    die if $hcol < 2;
+
+    # print Dumper(\@param, \%paramIndex, \%shortParamIndex, $hcol);
+}
+
+sub process1LongParam {
+    my ($p, $v) = @_;
+
+    $expectingArg = undef;
+    if ((my $a = $p->{'arg'})) {
+        my $invalid = $a->{'invalid'} // sub { undef };
+
+        $v = $a->{'default'} unless defined $v;
+        if (defined($v)) {
+            unshift @_, $v
+        }
+        if (defined($v // $a->{'default'})) {
+            unshift @_, $v
+        }
+        elsif (!$argsDone) {
+            $expectingArg = $p
+        }
+        else {
+            push @usage, $p->{'name'};
+            return
+        }
+    }
+    return if $expectingArg;
+
+    goto $p->{'function'}
+}
+
+sub processLongParam {
+    $_ = substr($_, 1); # remove leading '-'
+
+    my $i = $paramIndex{$_};
+    my $v = undef;
+
+    if (!defined($i) && /^([^=]+)=(.+)$/) {
+        ($_, $v, $i) = ($1, $paramIndex{$1}, $2);
+    }
+    print STDERR Dumper($_, $i);
+    die "unknown parameter '--$_'\n" unless defined($i);
+
+    my $p = $param[$i];
+    print STDERR Dumper($p);
+
+    if (defined(my $a = $p->{'arg'})) {
+    }
+    elsif (defined($a)) {
+        push @usage, $_;
+        return;
+    }
+    else {
+        process1LongParam $p, undef;
+    }
+}
+
+sub process1ShortParam {
+    my $i = $shortParamIndex{$_[0]} or die "unknown parameter '-$_[0]'\n";
+    my $p = $param[$i];
+    my $a = undef;
+    my $y = $_[1];
+
+    if (($p->{'hasArg'} || defined($p->{'argDefault'})) && $y) {
+        if ($y =~ /^=(.+)/) {
+            ($a, $y) = ($1, '');
+        }
+        elsif ($p->{'hasArg'}) {
+            ($a, $y) = ($_[1], '');
+        }
+    }
+    process1LongParam $p, $a;
+    $y
+}
+
+sub processShortParam {
+    while (length) {
+        $_ = process1ShortParam substr($_, 0, 1), substr($_, 1);
+    }
+}
+
+sub process1Param {
+    $_ = substr($_, 1); # remove leading '-'
+    if (/^-/) {
+        goto &processLongParam;
+    }
+    else {
+        goto &processShortParam;
+    }
+}
+
+my $mode;
+sub processParam($) {
+    local $_ = shift;
+    if (/^--$/) {
+        process1LongParam $expectingArg if $expectingArg;
+        $mode = 1;
+    }
+    else {
+        goto &process1Param;
+    }
+}
+
+sub loadArg($) {
+    goto \&processFqdParam if $mode;
+    if ($expectingArg) {
+        if (!defined($expectingArg->{'argDefault'}) || $_[0] !~ /^-/) {
+            unshift @_, $expectingArg;
+            goto \&process1LongParam;
+        }
+        process1LongParam $expectingArg;
+    }
+    goto &processParam if $_[0] =~ /^-/;
+
+    local $_ = shift;
+    my $fh = IO::File->new($_, 'r') or goto NOT_A_FILE;
+    loadFile($fh);
+    return !0;
+
+NOT_A_FILE:
+    # warn "$_ is not a file\n";
+    push @fromArgv, $_
+}
+
+sub loadArgs
+{
+    setParams;
+    loadArg $_ for (@_);
+    process1LongParam $expectingArg if $expectingArg;
+    if (@usage) {
+        my %seen;
+        local $_;
+        print("Usage:\n");
+        for (@usage) {
+            next if $seen{$_}++;
+            my $p = $param[$paramIndex{$_}];
+            printf("%s\n", paramHelp $p);
+        }
+        exit(64);
+    }
+}
+
+sub disk_avail {
+    my ($path, $m) = @_;
+    my $kid = open(my $pipe, '-|') // die "can't fork: $!";
+
+    if ($kid == 0) {
+        exec 'df', ($path // '.');
+        die "can't exec df: $!";
+    }
+
+    local $_ = <$pipe> // die "can't read from df: $!";
+    chomp;
+
+    my $blksize;
+    if (/^\s*Filesystem\s+([^-]+)-blocks\s+Used\s+Available/i) {
+        $_ = $1;
+        if (/^(\d+)M$/i) {
+            $blksize = 1024 * 1024 * (0+$1);
+        }
+        elsif (/^(\d+)K$/i) {
+            $blksize = 1024 * (0+$1);
+        }
+        elsif (/^(\d+)$/i) {
+            $blksize = 0+$1;
+        }
+    }
+    elsif  (/^\s*Filesystem\s+Size\s+Used\s+Available/i) {
+        $blksize = 0;
+    }
+
+    $_ = <$pipe> // die "can't read from df: $!";
+    while (defined(<$pipe>)) {}
+    waitpid $kid, 0;
+
+    my (undef, undef, undef, $avail) = split /\s+/;
+
+    if ($blksize =~ /^\d+$/) {
+        my $y;
+        if ($avail =~ /^\d+$/) {
+            $y = $avail * ($blksize > 0 ? $blksize : 1)
+        }
+        elsif ($blksize =~ /^(\d+)Pi?$/i) {
+            $y = $1 * 1024 * 1024 * 1024 * 1024
+        }
+        elsif ($blksize =~ /^(\d+)Gi?$/i) {
+            $y = $1 * 1024 * 1024 * 1024
+        }
+        elsif ($blksize =~ /^(\d+)Mi?$/i) {
+            $y = $1 * 1024 * 1024
+        }
+        elsif ($blksize =~ /^(\d+)Ki?$/i) {
+            $y = $1 * 1024
+        }
+        $y = int($y / $m) if $m;
+        return ($y >> 30)."G" if $y > 1024 * 1024 * 1024;
+        return ($y >> 20)."M" if $y > 1024 * 1024;
+        return ($y >> 10)."K" if $y > 1024;
+        return $y
+    }
+    die "can't understand df."
+}
+
+sub which($) {
+    my $exe = shift;
+    local $_;
+
+    for (File::Spec->path()) {
+        my $fullpath = File::Spec->catfile($_, $exe);
+        return $fullpath if -x $fullpath;
+    }
+    die "no $exe in".join(':', File::Spec->path());
+}
+
+sub procCount {
+    scalar grep { /^processor\s/ } do {
+        local $_ = undef;
+        open my $fh, '<', '/proc/cpuinfo' or die "can't open /proc/cpuinfo: $!";
+        <$fh>
+    }
+}
+
+sub threads {
+    # result will be 2..8
+    my $y = ((procCount() || 3) >> 1) & ~1;
+    $y < 2 ? 2 : $y < 8 ? $y : 8
+}
+
+sub temp_location {
+    for (qw( TMPDIR TMP_DIR TEMPDIR TEMP_DIR TMP )) {
+        return $ENV{$_} if $ENV{$_} && -d $ENV{$_};
+    }
+    return '/tmp' if -d '/tmp';
+    warn "No temp directory is set, using .";
+    '.'
+}
+
+sub mem_avail {
+    my %meminfo = grep { defined } map { /^([^:]+):\s+(\d+)\s+kb$/i ? (uc $1, $2) : undef } do {
+        local $_ = undef;
+        open my $fh, '<', '/proc/meminfo' or die "can't open /proc/meminfo: $!";
+        <$fh>
+    };
+    $meminfo{uc 'MemAvailable'}
+}
