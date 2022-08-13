@@ -161,10 +161,10 @@ sub fasterq($$) {
 }
 
 my $s3re;
-BEGIN { $s3re = qr{ ^https://([^.]+)\.s3(?:\.[^.]+)\.amazonaws\.com/(.+) }; }
+BEGIN { $s3re = qr{ ^https://([^.]+)\.s3\.(?:[^.]+\.)?amazonaws\.com/(.+) }; }
 sub nativeGet($) {
     local $_ = shift;
-    die "can't make an s3 URL from $_\n" unless m/$s3re/;
+    die "can't make an s3 URL from $_\n" unless /$s3re/i;
     my $url = "s3://$1/$2";
     my $dir = File::Temp->newdir();
     {
