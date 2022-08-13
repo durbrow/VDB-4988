@@ -170,7 +170,7 @@ sub nativeGet($) {
         $times{START_NATIVE_TOOL} = time;
         my $kid = fork // die "can't fork: $!";
         if ($kid == 0) {
-            exec { $nativeTools } qw[ aws s3 cp ], $url, './';
+            exec { $nativeTools } qw[ aws s3 --no-sign-request cp ], $url, './';
             die "can't exec aws s3 cp: $!";
         }
         waitpid $kid, 0;
