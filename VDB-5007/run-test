@@ -96,11 +96,10 @@ for (@$runs) {
         print '# Timing data';
         print '## Accession:', $run;
         print '### Tool', 'Elapsed';
-        print 'fasterq-dump (no prefetch)', sprintf('%.6f sec', $fqd->{'end'} - $fqd->{'start'});
-        for (qw[ fasterq-dump prefetch cloud ]) {
-            my $time = $times{$_};
-            print $_, sprintf('%.6f sec', $time->{'end'} - $time->{'start'});
-        }
+        print 'fasterq-dump (no prefetch)', sprintf('%.3f sec', $fqd->{'end'} - $fqd->{'start'});
+        print 'prefetch', sprintf('%.3f sec', $times{'prefetch'}->{'end'} - $times{'prefetch'}->{'start'});
+        print 'fasterq-dump (after prefetch)', sprintf('%.3f sec', $times{'fasterq-dump'}->{'end'} - $times{'fasterq-dump'}->{'start'});
+        print 'aws s3 cp', sprintf('%.3f sec', $times{'native'}->{'end'} - $times{'native'}->{'start'});
     }
 }
 
