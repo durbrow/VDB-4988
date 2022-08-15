@@ -2,6 +2,7 @@
 
 use strict;
 use warnings;
+use IO::Handle;
 use IO::File;
 use File::chdir;
 use File::Temp;
@@ -12,15 +13,6 @@ use Data::Dumper;
 
 use constant {
     SDL_LOCATION => 's3',
-    CLOUD_TOOLS => 'aws',
-    START_PREFETCH => 'prefetch Start',
-    END_PREFETCH => 'prefetch End',
-    START_FASTERQ_DUMP => 'fasterq-dump Start',
-    END_FASTERQ_DUMP => 'fasterq-dump End',
-    START_PREFETCH_FASTERQ_DUMP => 'prefetch+fasterq-dump Start',
-    END_PREFETCH_FASTERQ_DUMP => 'prefetch+fasterq-dump End',
-    START_NATIVE_TOOL => 'native tool Start',
-    END_NATIVE_TOOL => 'native tool End',
 };
 
 sub getURL($);
@@ -40,21 +32,13 @@ sub isRun($) {($_[0] =~ /^\s*([DES]RR\d{6,9})(?:\.\d+)?\s*$/i) ? uc($1) : undef 
 
 my %times = (
     'startup' => time,
-    START_PREFETCH => 0,
-    END_PREFETCH => 0,
-    START_FASTERQ_DUMP => 0,
-    END_FASTERQ_DUMP => 0,
-    START_PREFETCH_FASTERQ_DUMP => 0,
-    END_PREFETCH_FASTERQ_DUMP => 0,
-    START_NATIVE_TOOL => 0,
-    END_NATIVE_TOOL => 0,
 );
 
 chomp(my $dataDir = `pwd`); die unless $dataDir;
 my $srapathExe = which('srapath') or die;
 my $prefetchExe = which('prefetch') or die;
 my $fasterqExe = which('fasterq-dump') or die;
-my $nativeTools = which(CLOUD_TOOLS) or die;
+my $nativeTools = which('aws') or die;
 my @defaultRuns = qw{ DRR058709 SRR5909293 };
 my @fromArgv;
 my @fqdParams;
@@ -65,10 +49,27 @@ my $threadCount = threads;
 my $tempdir = temp_location;
 my $mem = mem_avail;
 my $disk = disk_avail('.', 2);
+# my $vout = IO::File->new('verbose.log', 'w+');
 
 loadArgs @ARGV;
 
 my $runs = @fromArgv ? \@fromArgv : \@defaultRuns;
+
+# if ($verbose) {
+#     my @lines = ();
+#
+#     $vout->flush();
+#     if ($vout->getpos) {
+#         $fh->rewind();
+#         @lines = $fh->getlines();
+#     }
+#     $vout->close();
+#     undef $vout;
+#     my @lines = IO::File->new('verbose.log', 'r')->getlines();
+#     unlink 'verbose.log';
+#     $vout = IO::Handle->new_from_fd(fileno(STDOUT), 'a');
+#
+# }
 
 if ($verbose) {
     printf("runs: [ %s ]\n", join(' ', @$runs));
@@ -85,9 +86,22 @@ for (@$runs) {
     my $run = $_;
     my $url = getURL($run);
     fasterq(0, $run);
+    my $fqd = $times{'fasterq-dump'};
     fasterq(1, $run);
     nativeGet($url);
     # print Dumper($_, $url);
+
+    {
+        local ($\, $,) = ("\n", "\t");
+        print '# Timing data';
+        print '## Accession:', $run;
+        print '### Tool', 'Elapsed';
+        print 'fasterq-dump (no prefetch)', sprintf('%.6f sec', $fqd->{'end'} - $fqd->{'start'});
+        for (qw[ fasterq-dump prefetch cloud ]) {
+            my $time = $times{$_};
+            print $_, sprintf('%.6f sec', $time->{'end'} - $time->{'start'});
+        }
+    }
 }
 
 exit 0;
@@ -114,16 +128,17 @@ sub prefetch($) {
         , '--progress'
         , $_[0]
     );
+    my %t = ( 'start' => time );
 
-    $times{START_PREFETCH} = time;
     my $kid = fork // die "can't fork: $!";
     if ($kid == 0) {
         exec { $prefetchExe } 'prefetch', @args;
         die "can't exec prefetch: $!";
     }
     waitpid $kid, 0;
+    $t{'end'} = time;
     die "prefetch exited with an error." if $?;
-    $times{END_PREFETCH} = time;
+    $times{'prefetch'} = \%t;
 }
 
 sub fasterq($$) {
@@ -139,44 +154,50 @@ sub fasterq($$) {
         , $run
     );
     my $effective = @fqdParams ? \@fqdParams : \@args;
-
-    $times{START_PREFETCH_FASTERQ_DUMP} = time if $use_prefetch;
+    my %t = ( 'start' => time );
 
     my $dir = File::Temp->newdir();
     {
         local $CWD = $dir;
         prefetch $run if $use_prefetch;
 
-        $times{START_FASTERQ_DUMP} = time;
+        my %t = ( 'start' => time );
         my $kid = fork // die "can't fork: $!";
         if ($kid == 0) {
             exec { $fasterqExe } 'fasterq-dump', @args;
             die "can't exec fasterq-dump: $!";
         }
         waitpid $kid, 0;
-        $times{END_FASTERQ_DUMP} = time unless $?;
+        $t{'end'} = time;
+        $times{'fasterq-dump'} = \%t unless $?;
     }
     exit 1 if $?;
-    $times{END_PREFETCH_FASTERQ_DUMP} = time if $use_prefetch;
+    $t{'end'} = time;
+    $times{'prefetch+fasterq-dump'} = \%t if $use_prefetch;
 }
 
 sub nativeGet($) {
     local $_ = shift;
-    die "can't make an s3 URL from $_\n" unless /^https:\/\/([^.]+)\.s3\.(?:[^.]+\.)?amazonaws\.com\/(.+)/i;
-    my $url = "s3://$1/$2";
+    die "can't make an s3 URL from $_\n" unless /^https:\/\/([^.]+)\.s3\.([^.]+\.)?amazonaws\.com\/(.+)/i;
+    my ($bucket, $region, $path) = ($1, $2, $3);
+    my $url = "s3://$bucket/$path";
+    my %t = ( 'start' => time );
     my $dir = File::Temp->newdir();
     {
         local $CWD = $dir;
         $times{START_NATIVE_TOOL} = time;
         my $kid = fork // die "can't fork: $!";
         if ($kid == 0) {
-            exec { $nativeTools } qw[ aws s3 --no-sign-request cp ], $url, './';
-            die "can't exec aws s3 cp: $!";
+            my @args = qw[ s3 --no-sign-request cp ];
+            push @args, '--source-region', $region if $region;
+            exec { $nativeTools } 'aws', @args, $url, './';
+            die "can't exec aws: $!";
         }
         waitpid $kid, 0;
+        $t{'end'} = time;
     }
     die "can't get $url using cloud native tool!\n" if $?;
-    $times{END_NATIVE_TOOL} = time;
+    $times{'cloud'} = \%t;
 }
 
 ### Implementation details follow ###
