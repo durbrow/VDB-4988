@@ -1,0 +1,418 @@
+#!/usr/bin/perl -w
+
+use strict;
+use warnings;
+use IO::Handle;
+use IO::File;
+use File::chdir;
+use File::Temp;
+use File::Spec;
+use Cwd;
+use Time::HiRes qw( time );
+use Getopt::Long;
+use Data::Dumper;
+
+use constant {
+    SDL_LOCATION => 's3',
+    EBI_REPORT_URL => 'https://www.ebi.ac.uk/ena/portal/filereport?result=read_run&fields=fastq_ftp&accession=',
+};
+
+sub getURL($);
+sub nativeGet($);
+sub prefetch($);
+sub fasterq($$);
+sub loadFile($);
+sub loadArgs;
+sub which($);
+sub threads;
+sub temp_location;
+sub mem_avail;
+sub disk_avail;
+
+sub isSRA($) { $_[0] =~ /^\s*[DES]R[APRSXZ]\d{6,9}(?:\.\d+)?\s*$/i }
+sub isRun($) {($_[0] =~ /^\s*([DES]RR\d{6,9})(?:\.\d+)?\s*$/i) ? uc($1) : undef }
+
+my %times = (
+    'startup' => time,
+);
+
+chomp(my $dataDir = `pwd`); die unless $dataDir;
+my $vlog = IO::File->new('verbose.log', 'w+');
+
+### Paths to executables that will be needed
+my $srapathExe = which('srapath') or die;
+my $prefetchExe = which('prefetch') or die;
+my $fasterqExe = which('fasterq-dump') or die;
+my $nativeTools = which('aws') or die;
+my $wgetExe = which('wget') or die;
+my $gunzipExe = which('gunzip') or die;
+
+my @defaultRuns = qw{ DRR058709 SRR5909293 };
+my @fromArgv;
+my @fqdParams;
+my $verbose = 1;
+my $dryRun = 0;
+my $threadCount = threads;
+my $tempdir = temp_location;
+my $mem = mem_avail;
+my $disk = disk_avail('.', 2);
+
+for (0 .. $#ARGV) {
+    my $val = $ARGV[$_];
+    if ($val eq '--') {
+        @fqdParams = splice @ARGV, $_;
+        splice @fqdParams, 0, 1;
+        last;
+    }
+}
+
+GetOptions(
+    'v|verbose+' => \$verbose,
+    'n|dryrun' => \$dryRun,
+    'threads=i' => \$threadCount,
+    'temp=s' => \$tempdir,
+    'm|mem=s' => \$mem,
+    'd|disk=s' => \$disk,
+    '<>' => sub {
+        local $_ = shift;
+        local $/ = undef;
+        my $fh = IO::File->new($_, 'r') or goto NOT_A_FILE;
+        push @fromArgv, $_ for (split /\s+/, <$fh>);
+        return;
+    NOT_A_FILE:
+        push @fromArgv, $_;
+    }
+);
+
+my $runs = @fromArgv ? \@fromArgv : \@defaultRuns;
+
+if ($verbose) {
+    my @lines = ();
+
+    $vlog->flush();
+    if ($vlog->getpos) {
+        $vlog->seek(0, 0);
+        @lines = $vlog->getlines;
+    }
+    $vlog->close();
+    undef $vlog;
+    unlink 'verbose.log';
+    $vlog = IO::Handle->new_from_fd(fileno(STDOUT), 'a');
+}
+
+$vlog->printf("runs: [ %s ]\n", join(', ', @$runs));
+$vlog->printf("threads: %u\n", $threadCount);
+$vlog->printf("memory: %u\n", $mem);
+$vlog->printf("temp: %s\n", $tempdir);
+$vlog->printf("temp free space: %s\n", disk_avail($tempdir));
+$vlog->printf("output: %s\n", $dataDir);
+$vlog->printf("output space: %s\n", $disk);
+exit 0 if $dryRun > 0;
+
+sub reportLine($$) {
+    local ($\, $,) = ("\n", "\t");
+    print $_[0], sprintf('%.3f sec', $_[1]->{'end'} - $_[1]->{'start'})
+}
+
+sub processRun($) {
+    my $run = $_[0];
+    $vlog->printf("Processing %s\n", $run);
+
+    my $url = getURL($run);
+    $vlog->printf("URL: %s\n", $url);
+
+    $vlog->printf("Fetch using aws s3 cp ...\n");
+    nativeGet($url);
+
+    $vlog->printf("Fetching fastq from EBI ...\n");
+    ebiGet($run);
+
+    $vlog->printf("Running fasterq-dump without prefetch ...\n");
+    fasterq(0, $run);
+    my $fqd = $times{'fasterq-dump'};
+
+    $vlog->printf("Running prefetch + fasterq-dump ...\n");
+    fasterq(1, $run);
+    $vlog->printf("Generating timing report ...\n");
+
+    print "# Elapsed times for $run\n";
+    reportLine('aws s3 cp', $times{'cloud'});
+    reportLine('EBI fastq', $times{'ebi'}) if $times{'ebi'};
+    reportLine('fasterq-dump (no prefetch)', $fqd);
+    reportLine('prefetch', $times{'prefetch'});
+    reportLine('fasterq-dump (after prefetch)', $times{'fasterq-dump'});
+}
+
+processRun $_ for (@$runs);
+
+exit 0;
+
+sub getURL($) {
+    my $kid = open(my $pipe, '-|') // die "can't fork: $!";
+
+    if ($kid == 0) {
+        exec { $srapathExe } 'srapath', '--location', SDL_LOCATION, @_;
+        die "can't exec srapath: $!";
+    }
+
+    local $_ = <$pipe> // die "can't read URL from srapath: $!";
+    chomp;
+    waitpid $kid, 0;
+    $_
+}
+
+sub prefetch($) {
+    my @args = (
+          '--location', SDL_LOCATION
+        , '--force', 'ALL'
+        , '--max-size', $disk
+        , '--progress'
+        , $_[0]
+    );
+    my %t = ( 'start' => time );
+
+    my $kid = fork // die "can't fork: $!";
+    if ($kid == 0) {
+        exec { $prefetchExe } 'prefetch', @args;
+        die "can't exec prefetch: $!";
+    }
+    waitpid $kid, 0;
+    $t{'end'} = time;
+    die "prefetch exited with an error." if $?;
+    $times{'prefetch'} = \%t;
+}
+
+sub fasterq($$) {
+    my ($use_prefetch, $run) = @_;
+    my @args = (
+          '--location', SDL_LOCATION
+        , '--force'
+        , '--split-3'
+        , '--temp', $tempdir
+        , '--threads', $threadCount
+        , '--mem', $mem
+        , '--details'
+        , $run
+    );
+    my $effective = @fqdParams ? \@fqdParams : \@args;
+    my %t = ( 'start' => time );
+
+    my $dir = File::Temp->newdir();
+    {
+        local $CWD = $dir;
+        prefetch $run if $use_prefetch;
+
+        my %t = ( 'start' => time );
+        my $kid = fork // die "can't fork: $!";
+        if ($kid == 0) {
+            exec { $fasterqExe } 'fasterq-dump', @args;
+            die "can't exec fasterq-dump: $!";
+        }
+        waitpid $kid, 0;
+        $t{'end'} = time;
+        $times{'fasterq-dump'} = \%t unless $?;
+    }
+    exit 1 if $?;
+    $t{'end'} = time;
+    $times{'prefetch+fasterq-dump'} = \%t if $use_prefetch;
+}
+
+sub nativeGet($) {
+    local $_ = shift;
+    die "can't make an s3 URL from $_\n" unless /^https:\/\/([^.]+)\.s3\.([^.]+\.)?amazonaws\.com\/(.+)/i;
+    my ($bucket, $region, $path) = ($1, $2, $3);
+    my $url = "s3://$bucket/$path";
+    my %t = ( 'start' => time );
+    my $dir = File::Temp->newdir();
+    {
+        local $CWD = $dir;
+        $times{START_NATIVE_TOOL} = time;
+        my $kid = fork // die "can't fork: $!";
+        if ($kid == 0) {
+            my @args = qw[ s3 --no-sign-request cp ];
+            push @args, '--source-region', $region if $region;
+            exec { $nativeTools } 'aws', @args, $url, './';
+            die "can't exec aws: $!";
+        }
+        waitpid $kid, 0;
+        $t{'end'} = time;
+    }
+    die "can't get $url using cloud native tool!\n" if $?;
+    $times{'cloud'} = \%t;
+}
+
+### Run `wget` to stdout.
+sub wget {
+    unshift @_, qw[ -O - ];
+    unshift @_, '-q' unless $verbose > 0;
+    exec { $wgetExe } 'wget', @_;
+    die "can't exec wget: $!";
+}
+
+sub ebiGetQueryURL($) { "".EBI_REPORT_URL.$_[0] }
+
+### Query EBI for the URL of a run's fastq file.
+sub ebiGetFastqURL($) {
+    my $url = ebiGetQueryURL($_[0]);
+    my $kid = open(my $pipe, '-|') // die "can't fork: $!";
+    wget($url) if $kid == 0;
+
+    my $hline = <$pipe> // return undef;
+    $hline =~ /^\s*run_accession\s+fastq_ftp\s*$/i or die "unexpected response from EBI:\n$hline\n";
+
+    my $dline = <$pipe> // die "unexpected response from EBI:\n$hline\n";
+    $pipe->close();
+    undef $pipe;
+    waitpid $kid, 0;
+    die "can't wget $url\n" if $?;
+
+    chomp $dline;
+    my @F = split /\s+/, $dline;
+
+    die "unexpected response from EBI:\n$dline\n" unless $#F >= 1;
+    warn "unexpected response from EBI:\n$dline\n" unless $#F == 1;
+    die "unexpected response from EBI:\n$dline\n" unless $F[0] eq $_;
+    warn "expected fastq from EBI:\n$dline\n" unless $F[1] =~ /\.fastq(?:\.gz)?$/;
+    $F[1];
+}
+
+sub ebiGet($) {
+    local $_ = shift;
+    my %t = ( 'start' => time );
+    my $url = ebiGetFastqURL $_;
+    unless (defined $url) {
+        warn "skipping EBI\n";
+        return;
+    }
+    my $kid = fork() // die "Can't fork: $!";
+
+    if ($kid == 0) {
+        open(STDOUT, '> /dev/null') // die "Can't write to /dev/null: $!";
+
+        if ($url =~ /\.gz$/) {
+            ### decompress it, or it's an invalid comparison to fasterq-dump
+            pipe(READER, WRITER) or die "pipe failed: $!";
+            $kid = fork() // die "can't fork: $!";
+            if ($kid) {
+                open(STDIN, "<&READER");
+                close WRITER;
+                exec { $gunzipExe } qw[ gunzip - ];
+            }
+            close READER;
+            open(STDOUT, ">&WRITER") // die "Can't reopen STDOUT: $!";
+        }
+        wget $url;
+    }
+    waitpid $kid, 0;
+    die "can't get fastq from EBI\n" if $?;
+
+    $t{'end'} = time;
+    $times{'ebi'} = \%t;
+}
+
+### Implementation details follow ###
+
+
+sub disk_avail {
+    my ($path, $m) = @_;
+    my $kid = open(my $pipe, '-|') // die "can't fork: $!";
+
+    if ($kid == 0) {
+        exec 'df', ($path // '.');
+        die "can't exec df: $!";
+    }
+
+    local $_ = <$pipe> // die "can't read from df: $!";
+    chomp;
+
+    my $blksize;
+    if (/^\s*Filesystem\s+([^-]+)-blocks\s+Used\s+Available/i) {
+        $_ = $1;
+        if (/^(\d+)M$/i) {
+            $blksize = 1024 * 1024 * (0+$1);
+        }
+        elsif (/^(\d+)K$/i) {
+            $blksize = 1024 * (0+$1);
+        }
+        elsif (/^(\d+)$/i) {
+            $blksize = 0+$1;
+        }
+    }
+    elsif  (/^\s*Filesystem\s+Size\s+Used\s+Available/i) {
+        $blksize = 0;
+    }
+
+    $_ = <$pipe> // die "can't read from df: $!";
+    while (defined(<$pipe>)) {}
+    waitpid $kid, 0;
+
+    my (undef, undef, undef, $avail) = split /\s+/;
+
+    if ($blksize =~ /^\d+$/) {
+        my $y;
+        if ($avail =~ /^\d+$/) {
+            $y = $avail * ($blksize > 0 ? $blksize : 1)
+        }
+        elsif ($blksize =~ /^(\d+)Pi?$/i) {
+            $y = $1 * 1024 * 1024 * 1024 * 1024
+        }
+        elsif ($blksize =~ /^(\d+)Gi?$/i) {
+            $y = $1 * 1024 * 1024 * 1024
+        }
+        elsif ($blksize =~ /^(\d+)Mi?$/i) {
+            $y = $1 * 1024 * 1024
+        }
+        elsif ($blksize =~ /^(\d+)Ki?$/i) {
+            $y = $1 * 1024
+        }
+        $y = int($y / $m) if $m;
+        return ($y >> 30)."G" if $y > 1024 * 1024 * 1024;
+        return ($y >> 20)."M" if $y > 1024 * 1024;
+        return ($y >> 10)."K" if $y > 1024;
+        return $y
+    }
+    die "can't understand df."
+}
+
+sub which($) {
+    my $exe = shift;
+    local $_;
+
+    for (File::Spec->path()) {
+        my $fullpath = File::Spec->catfile($_, $exe);
+        return $fullpath if -x $fullpath;
+    }
+    die "no $exe in".join(':', File::Spec->path());
+}
+
+sub procCount {
+    scalar grep { /^processor\s/ } do {
+        local $_ = undef;
+        open my $fh, '<', '/proc/cpuinfo' or die "can't open /proc/cpuinfo: $!";
+        <$fh>
+    }
+}
+
+sub threads {
+    # result will be 2..8
+    my $y = procCount() - 1;
+    $y < 2 ? 2 : $y < 8 ? $y : 8
+}
+
+sub temp_location {
+    for (qw( TMPDIR TMP_DIR TEMPDIR TEMP_DIR TMP )) {
+        return $ENV{$_} if $ENV{$_} && -d $ENV{$_};
+    }
+    return '/tmp' if -d '/tmp';
+    warn "No temp directory is set, using .";
+    '.'
+}
+
+sub mem_avail {
+    my %meminfo = grep { defined } map { /^([^:]+):\s+(\d+)\s+kb$/i ? (uc $1, $2) : undef } do {
+        local $_ = undef;
+        open my $fh, '<', '/proc/meminfo' or die "can't open /proc/meminfo: $!";
+        <$fh>
+    };
+    $meminfo{uc 'MemAvailable'}
+}
