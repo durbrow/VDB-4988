@@ -69,8 +69,8 @@ for (0 .. $#ARGV) {
 GetOptions(
     'v|verbose+' => \$verbose,
     'n|dryrun' => \$dryRun,
-    't|threads=i' => \$threadCount,
-    'T|temp=s' => \$tempdir,
+    'threads=i' => \$threadCount,
+    'temp=s' => \$tempdir,
     'm|mem=s' => \$mem,
     'd|disk=s' => \$disk,
     '<>' => sub {
@@ -91,7 +91,7 @@ if ($verbose) {
 
     $vlog->flush();
     if ($vlog->getpos) {
-        $vlog->rewind();
+        $vlog->seek(0, 0);
         @lines = $vlog->getlines;
     }
     $vlog->close();
