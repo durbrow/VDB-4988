@@ -257,7 +257,7 @@ sub ebiGetFastqURL($) {
     my $kid = open(my $pipe, '-|') // die "can't fork: $!";
     wget($url) if $kid == 0;
 
-    my $hline = <$pipe> // die "no response from EBI";
+    my $hline = <$pipe> // return undef;
     $hline =~ /^\s*run_accession\s+fastq_ftp\s*$/i or die "unexpected response from EBI:\n$hline\n";
 
     my $dline = <$pipe> // die "unexpected response from EBI:\n$hline\n";
@@ -280,6 +280,10 @@ sub ebiGet($) {
     local $_ = shift;
     my %t = ( 'start' => time );
     my $url = ebiGetFastqURL $_;
+    unless (defined $url) {
+        warn "skipping EBI\n";
+        return;
+    }
     my $kid = fork() // die "Can't fork: $!";
 
     if ($kid == 0) {
