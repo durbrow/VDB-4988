@@ -391,7 +391,7 @@ sub procCount {
 
 sub threads {
     # result will be 2..8
-    my $y = ((procCount() || 3) >> 1) & ~1;
+    my $y = procCount() - 1;
     $y < 2 ? 2 : $y < 8 ? $y : 8
 }
 
