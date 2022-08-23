@@ -9,10 +9,12 @@ use File::Temp;
 use File::Spec;
 use Cwd;
 use Time::HiRes qw( time );
+use Getopt::Long;
 use Data::Dumper;
 
 use constant {
     SDL_LOCATION => 's3',
+    EBI_REPORT_URL => 'https://www.ebi.ac.uk/ena/portal/filereport?result=read_run&fields=fastq_ftp&accession=',
 };
 
 sub getURL($);
@@ -35,73 +37,113 @@ my %times = (
 );
 
 chomp(my $dataDir = `pwd`); die unless $dataDir;
+my $vlog = IO::File->new('verbose.log', 'w+');
+
+### Paths to executables that will be needed
 my $srapathExe = which('srapath') or die;
 my $prefetchExe = which('prefetch') or die;
 my $fasterqExe = which('fasterq-dump') or die;
 my $nativeTools = which('aws') or die;
+my $wgetExe = which('wget') or die;
+my $gunzipExe = which('gunzip') or die;
+
 my @defaultRuns = qw{ DRR058709 SRR5909293 };
 my @fromArgv;
 my @fqdParams;
 my $verbose = 1;
 my $dryRun = 0;
-my @usage;
 my $threadCount = threads;
 my $tempdir = temp_location;
 my $mem = mem_avail;
 my $disk = disk_avail('.', 2);
-# my $vout = IO::File->new('verbose.log', 'w+');
 
-loadArgs @ARGV;
+for (0 .. $#ARGV) {
+    my $val = $ARGV[$_];
+    if ($val eq '--') {
+        @fqdParams = splice @ARGV, $_;
+        splice @fqdParams, 0, 1;
+        last;
+    }
+}
+
+GetOptions(
+    'v|verbose+' => \$verbose,
+    'n|dryrun' => \$dryRun,
+    't|threads=i' => \$threadCount,
+    'T|temp=s' => \$tempdir,
+    'm|mem=s' => \$mem,
+    'd|disk=s' => \$disk,
+    '<>' => sub {
+        local $_ = shift;
+        local $/ = undef;
+        my $fh = IO::File->new($_, 'r') or goto NOT_A_FILE;
+        push @fromArgv, $_ for (split /\s+/, <$fh>);
+        return;
+    NOT_A_FILE:
+        push @fromArgv, $_;
+    }
+);
 
 my $runs = @fromArgv ? \@fromArgv : \@defaultRuns;
 
-# if ($verbose) {
-#     my @lines = ();
-#
-#     $vout->flush();
-#     if ($vout->getpos) {
-#         $fh->rewind();
-#         @lines = $fh->getlines();
-#     }
-#     $vout->close();
-#     undef $vout;
-#     my @lines = IO::File->new('verbose.log', 'r')->getlines();
-#     unlink 'verbose.log';
-#     $vout = IO::Handle->new_from_fd(fileno(STDOUT), 'a');
-#
-# }
-
 if ($verbose) {
-    printf("runs: [ %s ]\n", join(' ', @$runs));
-    printf("threads: %u\n", $threadCount);
-    printf("memory: %u\n", $mem);
-    printf("temp: %s\n", $tempdir);
-    printf("temp free space: %s\n", disk_avail($tempdir));
-    printf("output: %s\n", $dataDir);
-    printf("output space: %s\n", $disk);
+    my @lines = ();
+
+    $vlog->flush();
+    if ($vlog->getpos) {
+        $vlog->rewind();
+        @lines = $vlog->getlines;
+    }
+    $vlog->close();
+    undef $vlog;
+    unlink 'verbose.log';
+    $vlog = IO::Handle->new_from_fd(fileno(STDOUT), 'a');
 }
+
+$vlog->printf("runs: [ %s ]\n", join(', ', @$runs));
+$vlog->printf("threads: %u\n", $threadCount);
+$vlog->printf("memory: %u\n", $mem);
+$vlog->printf("temp: %s\n", $tempdir);
+$vlog->printf("temp free space: %s\n", disk_avail($tempdir));
+$vlog->printf("output: %s\n", $dataDir);
+$vlog->printf("output space: %s\n", $disk);
 exit 0 if $dryRun > 0;
 
-for (@$runs) {
-    my $run = $_;
+sub reportLine($$) {
+    local ($\, $,) = ("\n", "\t");
+    print $_[0], sprintf('%.3f sec', $_[1]->{'end'} - $_[1]->{'start'})
+}
+
+sub processRun($) {
+    my $run = $_[0];
+    $vlog->printf("Processing %s\n", $run);
+
     my $url = getURL($run);
+    $vlog->printf("URL: %s\n", $url);
+
+    $vlog->printf("Fetch using aws s3 cp ...\n");
+    nativeGet($url);
+
+    $vlog->printf("Fetching fastq from EBI ...\n");
+    ebiGet($run);
+
+    $vlog->printf("Running fasterq-dump without prefetch ...\n");
     fasterq(0, $run);
     my $fqd = $times{'fasterq-dump'};
-    fasterq(1, $run);
-    nativeGet($url);
-    # print Dumper($_, $url);
 
-    {
-        local ($\, $,) = ("\n", "\t");
-        print '# Timing data';
-        print '## Accession:', $run;
-        print '### Tool', 'Elapsed';
-        print 'fasterq-dump (no prefetch)', sprintf('%.3f sec', $fqd->{'end'} - $fqd->{'start'});
-        print 'prefetch', sprintf('%.3f sec', $times{'prefetch'}->{'end'} - $times{'prefetch'}->{'start'});
-        print 'fasterq-dump (after prefetch)', sprintf('%.3f sec', $times{'fasterq-dump'}->{'end'} - $times{'fasterq-dump'}->{'start'});
-        print 'aws s3 cp', sprintf('%.3f sec', $times{'cloud'}->{'end'} - $times{'cloud'}->{'start'});
-    }
+    $vlog->printf("Running prefetch + fasterq-dump ...\n");
+    fasterq(1, $run);
+    $vlog->printf("Generating timing report ...\n");
+
+    print "# Elapsed times for $run\n";
+    reportLine('aws s3 cp', $times{'cloud'});
+    reportLine('EBI fastq', $times{'ebi'}) if $times{'ebi'};
+    reportLine('fasterq-dump (no prefetch)', $fqd);
+    reportLine('prefetch', $times{'prefetch'});
+    reportLine('fasterq-dump (after prefetch)', $times{'fasterq-dump'});
 }
+
+processRun $_ for (@$runs);
 
 exit 0;
 
@@ -199,313 +241,73 @@ sub nativeGet($) {
     $times{'cloud'} = \%t;
 }
 
+### Run `wget` to stdout.
+sub wget {
+    unshift @_, qw[ -O - ];
+    unshift @_, '-q' unless $verbose > 0;
+    exec { $wgetExe } 'wget', @_;
+    die "can't exec wget: $!";
+}
+
+sub ebiGetQueryURL($) { "".EBI_REPORT_URL.$_[0] }
+
+### Query EBI for the URL of a run's fastq file.
+sub ebiGetFastqURL($) {
+    my $url = ebiGetQueryURL($_[0]);
+    my $kid = open(my $pipe, '-|') // die "can't fork: $!";
+    wget($url) if $kid == 0;
+
+    my $hline = <$pipe> // die "no response from EBI";
+    $hline =~ /^\s*run_accession\s+fastq_ftp\s*$/i or die "unexpected response from EBI:\n$hline\n";
+
+    my $dline = <$pipe> // die "unexpected response from EBI:\n$hline\n";
+    $pipe->close();
+    undef $pipe;
+    waitpid $kid, 0;
+    die "can't wget $url\n" if $?;
+
+    chomp $dline;
+    my @F = split /\s+/, $dline;
+
+    die "unexpected response from EBI:\n$dline\n" unless $#F >= 1;
+    warn "unexpected response from EBI:\n$dline\n" unless $#F == 1;
+    die "unexpected response from EBI:\n$dline\n" unless $F[0] eq $_;
+    warn "expected fastq from EBI:\n$dline\n" unless $F[1] =~ /\.fastq(?:\.gz)?$/;
+    $F[1];
+}
+
+sub ebiGet($) {
+    local $_ = shift;
+    my %t = ( 'start' => time );
+    my $url = ebiGetFastqURL $_;
+    my $kid = fork() // die "Can't fork: $!";
+
+    if ($kid == 0) {
+        open(STDOUT, '> /dev/null') // die "Can't write to /dev/null: $!";
+
+        if ($url =~ /\.gz$/) {
+            ### decompress it, or it's an invalid comparison to fasterq-dump
+            pipe(READER, WRITER) or die "pipe failed: $!";
+            $kid = fork() // die "can't fork: $!";
+            if ($kid) {
+                open(STDIN, "<&READER");
+                close WRITER;
+                exec { $gunzipExe } qw[ gunzip - ];
+            }
+            close READER;
+            open(STDOUT, ">&WRITER") // die "Can't reopen STDOUT: $!";
+        }
+        wget $url;
+    }
+    waitpid $kid, 0;
+    die "can't get fastq from EBI\n" if $?;
+
+    $t{'end'} = time;
+    $times{'ebi'} = \%t;
+}
+
 ### Implementation details follow ###
 
-sub loadFile($) {
-    my $fh = shift;
-    while (defined(local $_ = <$fh>)) {
-        push @fromArgv, split(/\s+/);
-    }
-}
-
-sub processFqdParam($) {
-    push @fqdParams, $_[0];
-}
-
-sub help;
-
-sub verbosity {
-    if (/[^-+0-9]/) {
-NEED_VERBOSE_USAGE:
-        push @usage, 'verbose';
-        return;
-    }
-    #                 1      2      3          4
-    while (/^\s*(?:(?:([-+]*)(\d+))|([-+]+))\s*(.*)/) {
-        my ($sgn, $digs);
-        ($sgn, $digs, $_) = ($3 || $1, $2, $4);
-
-        if (length($sgn) == 0) {
-            # overwriting not incrementing
-            $verbose = 0;
-        }
-        elsif (length($digs) > 0) {
-            # move last sign to start of number
-            ($sgn, $digs) = (substr($sgn, 0, -1), substr($sgn, -1).$digs);
-        }
-        $verbose += ($sgn =~ tr/+//);
-        $verbose -= ($sgn =~ tr/-//);
-        $verbose += $digs;
-    }
-}
-
-my @param;
-my %paramIndex;
-my %shortParamIndex;
-my $hcol;
-
-sub formatParam($) {
-    my $p = shift;
-    my $y = ' 'x4;
-
-    if ($p->{'shortName'}) {
-        $y .= join('|', map { "-$_" } split(//, $p->{'shortName'})).'|';
-    }
-    $y .= '--'.$p->{name}.' ';
-    if ((my $a = $p->{'arg'})) {
-        $y .= '<'.($a->{'name'} // 'arg').'> ';
-    }
-    $y .= ' ' while (length($y) % 4 != 0);
-    $y
-}
-
-sub paramHelp($) {
-    local $_;
-    my $p = shift;
-    my $y = formatParam $p;
-
-    $y .= ' ' while (length($y) < $hcol);
-
-    my $lines = 1;
-    my $nl = "\n" . " "x$hcol;
-    if (ref $p->{'help'}) {
-        for (@$p->{'help'}) {
-            $y .= $nl if ($lines++ > 1);
-            $y .= $_;
-        }
-    }
-    else {
-        $y .= $p->{'help'};
-    }
-    if ((my $a = $p->{'arg'})) {
-        if (ref $a->{'help'}) {
-            $y .= $nl.$_ for (@{$a->{'help'}});
-        }
-        elsif ($a->{'help'}) {
-            $y .= $nl.$a->{'help'};
-        }
-    }
-    $y
-}
-
-sub help {
-    print(<<"HELP");
-Usage: $0 [<param> ...] [<file> ...] [<accession> ...] [ -- <fasterq-dump-params> ]
-    <file> should contain a whitespace delimited list of accessions
-        (tabs, spaces, and newlines all work as delimiters).
-HELP
-    if (@defaultRuns) {
-        print("\nIf no file or accession is given, the default accessions will be used:\n");
-        print(join("\n", map { "    $_" } @defaultRuns)."\n");
-    }
-
-    print(<<"HELP");
-
-  Parameters:
-HELP
-    printf("%s\n", paramHelp $_) for (@param);
-}
-
-my $expectingArg;
-my $argsDone;
-
-sub setParams {
-    return if @param;
-
-    @param = (
-        { 'name' => 'help', 'shortName' => 'h?', 'function' => \&help, 'help' => 'Display this help text.' },
-        { 'name' => 'verbose'
-        , 'shortName' => 'v'
-        , 'help' => 'Sets verbosity level.'
-        , 'arg' => {
-            'name' => 'value/increment',
-            'default' => '+1',
-            'invalid' => sub { /[^-+0-9]/ },
-            'help' => [
-                'The argument may be /^\d+|[+-]\d+|[+-]+$/;',
-                'values starting with +/- are incremental.',
-                'The default value is \'+1\'.',
-                'Examples: -v # increase by 1',
-                '          -v 2 # set verbosity to 2',
-                '          -v +2 # add 2',
-                '          -v ++ # same as -v ++',
-                ]
-            }
-        , 'function' => \&verbosity
-        },
-        { 'name' => 'temp', 'shortName' => 't'
-        , 'help' => 'Change default temp directory from \''.$tempdir.'\'.'
-        , 'arg' =>
-            { 'name' => 'path'
-            , 'invalid' => sub { -d ? undef : "$_ is not a directory." }
-            }
-        , 'function' => sub { $tempdir = $_ }
-        },
-    );
-    my %tmp;
-
-    for (@param) {
-        my ($k, $s) = ($_->{'name'}, $_->{'shortName'});
-
-        $paramIndex{$k} = scalar %paramIndex;
-        next unless $s;
-
-        for (split //, $s) {
-            die "duplicate mapping for '-$_'; can't map to both '--$tmp{$_}' and '--$k'\n" if exists($tmp{$_}) && $tmp{$_} ne $k;
-            $tmp{$_} = $k;
-        }
-    }
-    $shortParamIndex{$_} = $paramIndex{$tmp{$_}} for (keys %tmp);
-
-    $hcol = 1;
-    my $val = 0;
-    for (@param) {
-        my $col = length formatParam $_;
-        $val = $col if ($val < $col);
-    }
-    $hcol = $val;
-    die if $hcol < 2;
-
-    # print Dumper(\@param, \%paramIndex, \%shortParamIndex, $hcol);
-}
-
-sub process1LongParam {
-    my ($p, $v) = @_;
-
-    $expectingArg = undef;
-    if ((my $a = $p->{'arg'})) {
-        my $invalid = $a->{'invalid'} // sub { undef };
-
-        $v = $a->{'default'} unless defined $v;
-        if (defined($v)) {
-            unshift @_, $v
-        }
-        if (defined($v // $a->{'default'})) {
-            unshift @_, $v
-        }
-        elsif (!$argsDone) {
-            $expectingArg = $p
-        }
-        else {
-            push @usage, $p->{'name'};
-            return
-        }
-    }
-    return if $expectingArg;
-
-    goto $p->{'function'}
-}
-
-sub processLongParam {
-    $_ = substr($_, 1); # remove leading '-'
-
-    my $i = $paramIndex{$_};
-    my $v = undef;
-
-    if (!defined($i) && /^([^=]+)=(.+)$/) {
-        ($_, $v, $i) = ($1, $paramIndex{$1}, $2);
-    }
-    print STDERR Dumper($_, $i);
-    die "unknown parameter '--$_'\n" unless defined($i);
-
-    my $p = $param[$i];
-    print STDERR Dumper($p);
-
-    if (defined(my $a = $p->{'arg'})) {
-    }
-    elsif (defined($a)) {
-        push @usage, $_;
-        return;
-    }
-    else {
-        process1LongParam $p, undef;
-    }
-}
-
-sub process1ShortParam {
-    my $i = $shortParamIndex{$_[0]} or die "unknown parameter '-$_[0]'\n";
-    my $p = $param[$i];
-    my $a = undef;
-    my $y = $_[1];
-
-    if (($p->{'hasArg'} || defined($p->{'argDefault'})) && $y) {
-        if ($y =~ /^=(.+)/) {
-            ($a, $y) = ($1, '');
-        }
-        elsif ($p->{'hasArg'}) {
-            ($a, $y) = ($_[1], '');
-        }
-    }
-    process1LongParam $p, $a;
-    $y
-}
-
-sub processShortParam {
-    while (length) {
-        $_ = process1ShortParam substr($_, 0, 1), substr($_, 1);
-    }
-}
-
-sub process1Param {
-    $_ = substr($_, 1); # remove leading '-'
-    if (/^-/) {
-        goto &processLongParam;
-    }
-    else {
-        goto &processShortParam;
-    }
-}
-
-my $mode;
-sub processParam($) {
-    local $_ = shift;
-    if (/^--$/) {
-        process1LongParam $expectingArg if $expectingArg;
-        $mode = 1;
-    }
-    else {
-        goto &process1Param;
-    }
-}
-
-sub loadArg($) {
-    goto \&processFqdParam if $mode;
-    if ($expectingArg) {
-        if (!defined($expectingArg->{'argDefault'}) || $_[0] !~ /^-/) {
-            unshift @_, $expectingArg;
-            goto \&process1LongParam;
-        }
-        process1LongParam $expectingArg;
-    }
-    goto &processParam if $_[0] =~ /^-/;
-
-    local $_ = shift;
-    my $fh = IO::File->new($_, 'r') or goto NOT_A_FILE;
-    loadFile($fh);
-    return !0;
-
-NOT_A_FILE:
-    # warn "$_ is not a file\n";
-    push @fromArgv, $_
-}
-
-sub loadArgs
-{
-    setParams;
-    loadArg $_ for (@_);
-    process1LongParam $expectingArg if $expectingArg;
-    if (@usage) {
-        my %seen;
-        local $_;
-        print("Usage:\n");
-        for (@usage) {
-            next if $seen{$_}++;
-            my $p = $param[$paramIndex{$_}];
-            printf("%s\n", paramHelp $p);
-        }
-        exit(64);
-    }
-}
 
 sub disk_avail {
     my ($path, $m) = @_;
