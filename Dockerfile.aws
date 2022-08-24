@@ -4,5 +4,7 @@ RUN apk --no-cache update \
  && apk --no-cache add perl aws-cli \
  && cpanm File::chdir \
  && apk del .build-deps
-COPY run-test .
-ENTRYPOINT [ "perl", "/run-test" ]
+COPY run-test /usr/local/bin
+COPY config.aws.pl /usr/local/bin/config.pl
+RUN chmod +x /usr/local/bin/run-test /usr/local/bin/config.pl
+ENTRYPOINT [ "perl", "/usr/local/bin/run-test" ]

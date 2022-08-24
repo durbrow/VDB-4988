@@ -13,9 +13,10 @@ use Getopt::Long;
 use Data::Dumper;
 
 use constant {
-    SDL_LOCATION => 's3',
     EBI_REPORT_URL => 'https://www.ebi.ac.uk/ena/portal/filereport?result=read_run&fields=fastq_ftp&accession=',
 };
+
+do './config.pl';
 
 sub getURL($);
 sub nativeGet($);
@@ -43,7 +44,7 @@ my $vlog = IO::File->new('verbose.log', 'w+');
 my $srapathExe = which('srapath') or die;
 my $prefetchExe = which('prefetch') or die;
 my $fasterqExe = which('fasterq-dump') or die;
-my $nativeTools = which('aws') or die;
+my $nativeTools = which(NATIVE_TOOL_NAME) or die;
 my $wgetExe = which('wget') or die;
 my $gunzipExe = which('gunzip') or die;
 
@@ -121,7 +122,7 @@ sub processRun($) {
     my $url = getURL($run);
     $vlog->printf("URL: %s\n", $url);
 
-    $vlog->printf("Fetch using aws s3 cp ...\n");
+    $vlog->printf("Fetching with ".NATIVE_TOOL_CMD." ...\n");
     nativeGet($url);
 
     $vlog->printf("Fetching fastq from EBI ...\n");
@@ -136,7 +137,7 @@ sub processRun($) {
     $vlog->printf("Generating timing report ...\n");
 
     print "# Elapsed times for $run\n";
-    reportLine('aws s3 cp', $times{'cloud'});
+    reportLine(NATIVE_TOOL_CMD, $times{'cloud'});
     reportLine('EBI fastq', $times{'ebi'}) if $times{'ebi'};
     reportLine('fasterq-dump (no prefetch)', $fqd);
     reportLine('prefetch', $times{'prefetch'});
@@ -219,20 +220,16 @@ sub fasterq($$) {
 
 sub nativeGet($) {
     local $_ = shift;
-    die "can't make an s3 URL from $_\n" unless /^https:\/\/([^.]+)\.s3\.([^.]+\.)?amazonaws\.com\/(.+)/i;
-    my ($bucket, $region, $path) = ($1, $2, $3);
-    my $url = "s3://$bucket/$path";
+    my $url = NATIVE_TOOL_URL;
+    die "can't make a cloud native URL from $_\n" unless $url;
     my %t = ( 'start' => time );
     my $dir = File::Temp->newdir();
     {
         local $CWD = $dir;
-        $times{START_NATIVE_TOOL} = time;
         my $kid = fork // die "can't fork: $!";
         if ($kid == 0) {
-            my @args = qw[ s3 --no-sign-request cp ];
-            push @args, '--source-region', $region if $region;
-            exec { $nativeTools } 'aws', @args, $url, './';
-            die "can't exec aws: $!";
+            exec { $nativeTools } NATIVE_TOOL_COPY_CMD($url);
+            die "can't exec $nativeTools: $!";
         }
         waitpid $kid, 0;
         $t{'end'} = time;
