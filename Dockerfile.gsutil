@@ -9,4 +9,5 @@ RUN apk --no-cache update \
 COPY run-test config.gsutil.pl /usr/local/bin
 RUN mv /usr/local/bin/config.gsutil.pl /usr/local/bin/config.pl \
  && chmod +x /usr/local/bin/run-test /usr/local/bin/config.pl
+ENV NCBI_VDB_QUALITY=R
 ENTRYPOINT [ "perl", "/usr/local/bin/run-test" ]
