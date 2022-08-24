@@ -16,7 +16,7 @@ use constant {
     EBI_REPORT_URL => 'https://www.ebi.ac.uk/ena/portal/filereport?result=read_run&fields=fastq_ftp&accession=',
 };
 
-do './config.pl';
+my $config = do '/usr/local/bin/config.pl' or die "can't get configuration: ".($@ || $!);
 
 sub getURL($);
 sub nativeGet($);
@@ -44,7 +44,7 @@ my $vlog = IO::File->new('verbose.log', 'w+');
 my $srapathExe = which('srapath') or die;
 my $prefetchExe = which('prefetch') or die;
 my $fasterqExe = which('fasterq-dump') or die;
-my $nativeTools = which(NATIVE_TOOL_NAME) or die;
+my $nativeTools = which($config->{NATIVE_TOOL_NAME}) or die;
 my $wgetExe = which('wget') or die;
 my $gunzipExe = which('gunzip') or die;
 
@@ -122,7 +122,7 @@ sub processRun($) {
     my $url = getURL($run);
     $vlog->printf("URL: %s\n", $url);
 
-    $vlog->printf("Fetching with ".NATIVE_TOOL_CMD." ...\n");
+    $vlog->printf("Fetching with ".$config->{NATIVE_TOOL_CMD}." ...\n");
     nativeGet($url);
 
     $vlog->printf("Fetching fastq from EBI ...\n");
@@ -137,7 +137,7 @@ sub processRun($) {
     $vlog->printf("Generating timing report ...\n");
 
     print "# Elapsed times for $run\n";
-    reportLine(NATIVE_TOOL_CMD, $times{'cloud'});
+    reportLine($config->{NATIVE_TOOL_CMD}, $times{'cloud'});
     reportLine('EBI fastq', $times{'ebi'}) if $times{'ebi'};
     reportLine('fasterq-dump (no prefetch)', $fqd);
     reportLine('prefetch', $times{'prefetch'});
@@ -152,7 +152,7 @@ sub getURL($) {
     my $kid = open(my $pipe, '-|') // die "can't fork: $!";
 
     if ($kid == 0) {
-        exec { $srapathExe } 'srapath', '--location', SDL_LOCATION, @_;
+        exec { $srapathExe } 'srapath', '--location', $config->{SDL_LOCATION}, @_;
         die "can't exec srapath: $!";
     }
 
@@ -164,7 +164,7 @@ sub getURL($) {
 
 sub prefetch($) {
     my @args = (
-          '--location', SDL_LOCATION
+          '--location', $config->{SDL_LOCATION}
         , '--force', 'ALL'
         , '--max-size', $disk
         , '--progress'
@@ -186,7 +186,7 @@ sub prefetch($) {
 sub fasterq($$) {
     my ($use_prefetch, $run) = @_;
     my @args = (
-          '--location', SDL_LOCATION
+          '--location', $config->{SDL_LOCATION}
         , '--force'
         , '--split-3'
         , '--temp', $tempdir
@@ -220,7 +220,7 @@ sub fasterq($$) {
 
 sub nativeGet($) {
     local $_ = shift;
-    my $url = NATIVE_TOOL_URL;
+    my $url = $config->{NATIVE_TOOL_URL}->();
     die "can't make a cloud native URL from $_\n" unless $url;
     my %t = ( 'start' => time );
     my $dir = File::Temp->newdir();
@@ -228,13 +228,13 @@ sub nativeGet($) {
         local $CWD = $dir;
         my $kid = fork // die "can't fork: $!";
         if ($kid == 0) {
-            exec { $nativeTools } NATIVE_TOOL_COPY_CMD($url);
+            exec { $nativeTools } $config->{NATIVE_TOOL_COPY_CMD}->($url);
             die "can't exec $nativeTools: $!";
         }
         waitpid $kid, 0;
         $t{'end'} = time;
     }
-    die "can't get $url using cloud native tool!\n" if $?;
+    die "can't get $_ using cloud native tool!\n" if $?;
     $times{'cloud'} = \%t;
 }
 

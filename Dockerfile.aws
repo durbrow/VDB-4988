@@ -1,10 +1,10 @@
 FROM ncbi/sra-tools:3.0.0
 RUN apk --no-cache update \
- && apk --no-cache add --virtual .build-deps perl-app-cpanminus wget make \
  && apk --no-cache add perl aws-cli \
+ && apk --no-cache add --virtual .build-deps perl-app-cpanminus wget make \
  && cpanm File::chdir \
  && apk del .build-deps
-COPY run-test /usr/local/bin
-COPY config.aws.pl /usr/local/bin/config.pl
-RUN chmod +x /usr/local/bin/run-test /usr/local/bin/config.pl
+COPY run-test config.aws.pl /usr/local/bin
+RUN mv /usr/local/bin/config.aws.pl /usr/local/bin/config.pl \
+ && chmod +x /usr/local/bin/run-test /usr/local/bin/config.pl
 ENTRYPOINT [ "perl", "/usr/local/bin/run-test" ]
