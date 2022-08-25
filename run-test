@@ -13,8 +13,20 @@ use Getopt::Long;
 use Data::Dumper;
 
 use constant {
-    EBI_REPORT_URL => 'https://www.ebi.ac.uk/ena/portal/filereport?result=read_run&fields=fastq_ftp&accession=',
+    EBI_REPORT_URL => 'https://www.ebi.ac.uk/ena/portal/api/filereport?result=read_run&fields=fastq_ftp&accession=',
+    URL_REGEX_S3 => qr{^https://([^./]+)\.s3(?:\.([^./]+))?\.amazonaws\.com/(.+)$}i,
+    URL_REGEX_GS => qr{^https://storage\.googleapis\.com/(.+)$}i,
+    URL_REGEX_NCBI => qr{^https://(?:[^/]*\.)?ncbi\.nlm\.nih\.gov/}i,
 };
+
+sub isSRA($) { $_[0] =~ /^\s*[DES]R[APRSXZ]\d{6,9}(?:\.\d+)?\s*$/i }
+sub isRun($) {($_[0] =~ /^\s*([DES]RR\d{6,9})(?:\.\d+)?\s*$/i) ? uc($1) : undef }
+sub cloudURL($) {
+    return { 'type' => 's3', 'url' => "s3://$1/$3", 'region' => $2 } if $_[0] =~ URL_REGEX_S3;
+    return { 'type' => 'gs', 'url' => "gs://$1" } if $_[0] =~ URL_REGEX_GS;
+    return { 'type' => 'ncbi', 'url' => $_[0] } if $_[0] =~ URL_REGEX_NCBI;
+    undef
+}
 
 my $config = do '/usr/local/bin/config.pl' or die "can't get configuration: ".($@ || $!);
 
@@ -29,9 +41,6 @@ sub threads;
 sub temp_location;
 sub mem_avail;
 sub disk_avail;
-
-sub isSRA($) { $_[0] =~ /^\s*[DES]R[APRSXZ]\d{6,9}(?:\.\d+)?\s*$/i }
-sub isRun($) {($_[0] =~ /^\s*([DES]RR\d{6,9})(?:\.\d+)?\s*$/i) ? uc($1) : undef }
 
 my %times = (
     'startup' => time,
@@ -122,11 +131,11 @@ sub processRun($) {
     my $url = getURL($run);
     $vlog->printf("URL: %s\n", $url);
 
-    $vlog->printf("Fetching with ".$config->{NATIVE_TOOL_CMD}." ...\n");
-    nativeGet($url);
-
     $vlog->printf("Fetching fastq from EBI ...\n");
     ebiGet($run);
+
+    $vlog->printf("Fetching with ".$config->{NATIVE_TOOL_CMD}." ...\n");
+    nativeGet($url);
 
     $vlog->printf("Running fasterq-dump without prefetch ...\n");
     fasterq(0, $run);
@@ -248,39 +257,51 @@ sub wget {
 
 sub ebiGetQueryURL($) { "".EBI_REPORT_URL.$_[0] }
 
-### Query EBI for the URL of a run's fastq file.
+### Query EBI for the URLs of a run's fastq file.
 sub ebiGetFastqURL($) {
-    my $url = ebiGetQueryURL($_[0]);
+    my $acc = $_[0];
+    my $url = ebiGetQueryURL($acc);
     my $kid = open(my $pipe, '-|') // die "can't fork: $!";
-    wget($url) if $kid == 0;
+    wget('-q', $url) if $kid == 0;
 
-    my $hline = <$pipe> // return undef;
-    $hline =~ /^\s*run_accession\s+fastq_ftp\s*$/i or die "unexpected response from EBI:\n$hline\n";
+    my @data;
+    do {
+        my $hline = <$pipe> // return undef;
+        chomp($hline);
+        $vlog->printf("ebi > %s\n", $hline);
+        my @H = split /\s+/, $hline;
+        die "unexpected response from EBI:\n$hline\n" unless $#H >= 1;
 
-    my $dline = <$pipe> // die "unexpected response from EBI:\n$hline\n";
+        while (defined(local $_ = <$pipe>)) {
+            chomp;
+            $vlog->printf("ebi > %s\n", $_);
+
+            my @F = \split /\s+/;
+            die "unexpected response from EBI:\n$_\n" unless $#F == $#H;
+
+            my $rec = {};
+            $rec->{$H[$_]} = ${$F[$_]} for (0 .. $#F);
+            push @data, $rec;
+        }
+    } while 0;
     $pipe->close();
     undef $pipe;
-    waitpid $kid, 0;
-    die "can't wget $url\n" if $?;
+    die "can't wget $url: exited with $?\n" if $?;
 
-    chomp $dline;
-    my @F = split /\s+/, $dline;
-
-    die "unexpected response from EBI:\n$dline\n" unless $#F >= 1;
-    warn "unexpected response from EBI:\n$dline\n" unless $#F == 1;
-    die "unexpected response from EBI:\n$dline\n" unless $F[0] eq $_;
-    warn "expected fastq from EBI:\n$dline\n" unless $F[1] =~ /\.fastq(?:\.gz)?$/;
-    $F[1];
+    my @FQF;
+    for (@data) {
+        next unless $_->{'run_accession'};
+        next unless $_->{'run_accession'} eq $acc;
+        die "unexpected response from EBI: expected fastq_ftp\n" unless $_->{'fastq_ftp'};
+        push @FQF, split(/;/, $_->{'fastq_ftp'});
+    }
+    die "unexpected response from EBI: no results for $acc\n" unless $#FQF > 0;
+    warn "expected fastq from EBI\n" if grep { !/\.fastq(?:\.gz)?$/ } @FQF;
+    @FQF;
 }
 
-sub ebiGet($) {
-    local $_ = shift;
-    my %t = ( 'start' => time );
-    my $url = ebiGetFastqURL $_;
-    unless (defined $url) {
-        warn "skipping EBI\n";
-        return;
-    }
+sub ebiGet1($) {
+    my $url = shift;
     my $kid = fork() // die "Can't fork: $!";
 
     if ($kid == 0) {
@@ -302,7 +323,17 @@ sub ebiGet($) {
     }
     waitpid $kid, 0;
     die "can't get fastq from EBI\n" if $?;
+}
 
+sub ebiGet($) {
+    local $_ = shift;
+    my @url = ebiGetFastqURL $_;
+    unless (@url) {
+        warn "skipping EBI\n";
+        return;
+    }
+    my %t = ( 'start' => time );
+    ebiGet1($_) for (@url);
     $t{'end'} = time;
     $times{'ebi'} = \%t;
 }
