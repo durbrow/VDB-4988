@@ -58,7 +58,7 @@ my $disk = disk_avail('.', 2);
 
 ### Defaults for this program
 my @defaultRuns = qw{ DRR058709 SRR5909293 };
-my $verbose = 1;
+my $verbose = 0;
 my $dryRun = 0;
 
 ### Populated ARGV
@@ -84,9 +84,10 @@ sub prefetch($) {
           '--location', $config->{SDL_LOCATION}
         , '--force', 'ALL'
         , '--max-size', $disk
-        , '--progress'
+#         , '--progress'
         , $_[0]
     );
+    unshift @args, '--progress' if $verbose;
     my %t = ( 'start' => time );
 
     my $kid = fork // die "can't fork: $!";
@@ -109,9 +110,10 @@ sub fasterq($$) {
         , '--temp', $tempdir
         , '--threads', $threadCount
         , '--mem', $mem
-        , '--details'
+#         , '--details'
         , $run
     );
+    unshift @args, '--details' if $verbose;
     my $effective = @fqdParams ? \@fqdParams : \@args;
     my %t = ( 'start' => time );
 
@@ -145,7 +147,7 @@ sub nativeGet($) {
         local $CWD = $dir;
         my $kid = fork // die "can't fork: $!";
         if ($kid == 0) {
-            exec { $nativeTools } $config->{NATIVE_TOOL_COPY_CMD}->($url);
+            exec { $nativeTools } $config->{NATIVE_TOOL_COPY_CMD}->($url, $verbose, $dryRun);
             die "can't exec $nativeTools: $!";
         }
         waitpid $kid, 0;
@@ -452,6 +454,11 @@ sub main {
 
     if ($dryRun == 0) {
         processRun $_ for @$runs;
+    }
+    unless ($verbose) {
+        $vlog->close();
+        undef $vlog;
+        unlink 'verbose.log';
     }
     return 0;
 }
