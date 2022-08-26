@@ -182,7 +182,7 @@ sub ebiGetFastqURL($) {
 
         while (defined(local $_ = <$pipe>)) {
             chomp;
-            $vlog->printf("ebi > %s\n", $_); # if $verbose > 1;
+            $vlog->printf("ebi > %s\n", $_) if $verbose > 1;
 
             my @F = \split /\s+/;
             die "unexpected response from EBI:\n$_\n" unless $#F == $#H;
@@ -362,24 +362,38 @@ sub processRun($) {
     my $url = getURL($run);
     $vlog->printf("URL: %s\n", $url);
 
-    $vlog->printf("Fetching fastq from EBI ...\n");
-    ebiGet($run);
+    my $doEBI = sub {
+        $vlog->printf("Fetching fastq from EBI ...\n");
+        ebiGet($run);
+    };
+    my $doNative = sub {
+        $vlog->printf("Fetching with ".$config->{NATIVE_TOOL_CMD}." ...\n");
+        nativeGet($url);
+    };
+    my $fqdt;
+    my $doFQD = sub {
+        $vlog->printf("Running fasterq-dump without prefetch ...\n");
+        fasterq(0, $run);
+        $fqdt = $times{'fasterq-dump'};
+    };
+    my $doPFQD = sub {
+        $vlog->printf("Running prefetch + fasterq-dump ...\n");
+        fasterq(1, $run);
+        $vlog->printf("Generating timing report ...\n");
+    };
+    my @tests = (
+        $doNative,
+        $doEBI,
+        $doFQD,
+        $doPFQD
+    );
 
-    $vlog->printf("Fetching with ".$config->{NATIVE_TOOL_CMD}." ...\n");
-    nativeGet($url);
-
-    $vlog->printf("Running fasterq-dump without prefetch ...\n");
-    fasterq(0, $run);
-    my $fqd = $times{'fasterq-dump'};
-
-    $vlog->printf("Running prefetch + fasterq-dump ...\n");
-    fasterq(1, $run);
-    $vlog->printf("Generating timing report ...\n");
+    $_->() for @tests; #[1, 0, 2, 3];
 
     print "# Elapsed times for $run\n";
     reportLine($config->{NATIVE_TOOL_CMD}, $times{'cloud'});
     reportLine('EBI fastq', $times{'ebi'}) if $times{'ebi'};
-    reportLine('fasterq-dump (no prefetch)', $fqd);
+    reportLine('fasterq-dump (no prefetch)', $fqdt);
     reportLine('prefetch', $times{'prefetch'});
     reportLine('fasterq-dump (after prefetch)', $times{'fasterq-dump'});
 }
