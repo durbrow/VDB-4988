@@ -30,26 +30,15 @@ sub cloudURL($) {
 
 my $config = do '/usr/local/bin/config.pl' or die "can't get configuration: ".($@ || $!);
 
-sub getURL($);
-sub nativeGet($);
-sub prefetch($);
-sub fasterq($$);
-sub loadFile($);
-sub loadArgs;
-sub which($);
-sub threads;
-sub temp_location;
-sub mem_avail;
-sub disk_avail;
-
 my %times = (
     'startup' => time,
 );
 
 chomp(my $dataDir = `pwd`); die unless $dataDir;
-my $vlog = IO::File->new('verbose.log', 'w+');
+my $vlog = IO::File->new('verbose.log', 'w+'); # set this before much else happens
 
 ### Paths to executables that will be needed
+sub which($);
 my $srapathExe = which('srapath') or die;
 my $prefetchExe = which('prefetch') or die;
 my $fasterqExe = which('fasterq-dump') or die;
@@ -57,105 +46,24 @@ my $nativeTools = which($config->{NATIVE_TOOL_NAME}) or die;
 my $wgetExe = which('wget') or die;
 my $gunzipExe = which('gunzip') or die;
 
-my @defaultRuns = qw{ DRR058709 SRR5909293 };
-my @fromArgv;
-my @fqdParams;
-my $verbose = 1;
-my $dryRun = 0;
+### Defaults for fasterq-dump
+sub threads;
+sub temp_location;
+sub mem_avail;
+sub disk_avail;
 my $threadCount = threads;
 my $tempdir = temp_location;
 my $mem = mem_avail;
 my $disk = disk_avail('.', 2);
 
-for (0 .. $#ARGV) {
-    my $val = $ARGV[$_];
-    if ($val eq '--') {
-        @fqdParams = splice @ARGV, $_;
-        splice @fqdParams, 0, 1;
-        last;
-    }
-}
+### Defaults for this program
+my @defaultRuns = qw{ DRR058709 SRR5909293 };
+my $verbose = 1;
+my $dryRun = 0;
 
-GetOptions(
-    'v|verbose+' => \$verbose,
-    'n|dryrun' => \$dryRun,
-    'threads=i' => \$threadCount,
-    'temp=s' => \$tempdir,
-    'm|mem=s' => \$mem,
-    'd|disk=s' => \$disk,
-    '<>' => sub {
-        local $_ = shift;
-        local $/ = undef;
-        my $fh = IO::File->new($_, 'r') or goto NOT_A_FILE;
-        push @fromArgv, $_ for (split /\s+/, <$fh>);
-        return;
-    NOT_A_FILE:
-        push @fromArgv, $_;
-    }
-);
-
-my $runs = @fromArgv ? \@fromArgv : \@defaultRuns;
-
-if ($verbose) {
-    my @lines = ();
-
-    $vlog->flush();
-    if ($vlog->getpos) {
-        $vlog->seek(0, 0);
-        @lines = $vlog->getlines;
-    }
-    $vlog->close();
-    undef $vlog;
-    unlink 'verbose.log';
-    $vlog = IO::Handle->new_from_fd(fileno(STDOUT), 'a');
-}
-
-$vlog->printf("runs: [ %s ]\n", join(', ', @$runs));
-$vlog->printf("threads: %u\n", $threadCount);
-$vlog->printf("memory: %u\n", $mem);
-$vlog->printf("temp: %s\n", $tempdir);
-$vlog->printf("temp free space: %s\n", disk_avail($tempdir));
-$vlog->printf("output: %s\n", $dataDir);
-$vlog->printf("output space: %s\n", $disk);
-exit 0 if $dryRun > 0;
-
-sub reportLine($$) {
-    local ($\, $,) = ("\n", "\t");
-    print $_[0], sprintf('%.3f sec', $_[1]->{'end'} - $_[1]->{'start'})
-}
-
-sub processRun($) {
-    my $run = $_[0];
-    $vlog->printf("Processing %s\n", $run);
-
-    my $url = getURL($run);
-    $vlog->printf("URL: %s\n", $url);
-
-    $vlog->printf("Fetching fastq from EBI ...\n");
-    ebiGet($run);
-
-    $vlog->printf("Fetching with ".$config->{NATIVE_TOOL_CMD}." ...\n");
-    nativeGet($url);
-
-    $vlog->printf("Running fasterq-dump without prefetch ...\n");
-    fasterq(0, $run);
-    my $fqd = $times{'fasterq-dump'};
-
-    $vlog->printf("Running prefetch + fasterq-dump ...\n");
-    fasterq(1, $run);
-    $vlog->printf("Generating timing report ...\n");
-
-    print "# Elapsed times for $run\n";
-    reportLine($config->{NATIVE_TOOL_CMD}, $times{'cloud'});
-    reportLine('EBI fastq', $times{'ebi'}) if $times{'ebi'};
-    reportLine('fasterq-dump (no prefetch)', $fqd);
-    reportLine('prefetch', $times{'prefetch'});
-    reportLine('fasterq-dump (after prefetch)', $times{'fasterq-dump'});
-}
-
-processRun $_ for (@$runs);
-
-exit 0;
+### Populated ARGV
+my @fromArgv;
+my @fqdParams;
 
 sub getURL($) {
     my $kid = open(my $pipe, '-|') // die "can't fork: $!";
@@ -229,8 +137,8 @@ sub fasterq($$) {
 
 sub nativeGet($) {
     local $_ = shift;
-    my $url = $config->{NATIVE_TOOL_URL}->();
-    die "can't make a cloud native URL from $_\n" unless $url;
+    my $url = cloudURL($_) // die "don't know what to do with URL $_\n";
+    die "$_ is a URL for $url->{type} not $config->{SDL_LOCATION}\n" unless $url->{type} eq $config->{SDL_LOCATION};
     my %t = ( 'start' => time );
     my $dir = File::Temp->newdir();
     {
@@ -268,13 +176,13 @@ sub ebiGetFastqURL($) {
     do {
         my $hline = <$pipe> // return undef;
         chomp($hline);
-        $vlog->printf("ebi > %s\n", $hline);
+        $vlog->printf("ebi > %s\n", $hline) if $verbose > 2;
         my @H = split /\s+/, $hline;
         die "unexpected response from EBI:\n$hline\n" unless $#H >= 1;
 
         while (defined(local $_ = <$pipe>)) {
             chomp;
-            $vlog->printf("ebi > %s\n", $_);
+            $vlog->printf("ebi > %s\n", $_); # if $verbose > 1;
 
             my @F = \split /\s+/;
             die "unexpected response from EBI:\n$_\n" unless $#F == $#H;
@@ -285,8 +193,8 @@ sub ebiGetFastqURL($) {
         }
     } while 0;
     $pipe->close();
-    undef $pipe;
     die "can't wget $url: exited with $?\n" if $?;
+    undef $pipe;
 
     my @FQF;
     for (@data) {
@@ -295,7 +203,7 @@ sub ebiGetFastqURL($) {
         die "unexpected response from EBI: expected fastq_ftp\n" unless $_->{'fastq_ftp'};
         push @FQF, split(/;/, $_->{'fastq_ftp'});
     }
-    die "unexpected response from EBI: no results for $acc\n" unless $#FQF > 0;
+    die "unexpected response from EBI: no results for $acc\n" unless @FQF;
     warn "expected fastq from EBI\n" if grep { !/\.fastq(?:\.gz)?$/ } @FQF;
     @FQF;
 }
@@ -337,9 +245,6 @@ sub ebiGet($) {
     $t{'end'} = time;
     $times{'ebi'} = \%t;
 }
-
-### Implementation details follow ###
-
 
 sub disk_avail {
     my ($path, $m) = @_;
@@ -444,3 +349,97 @@ sub mem_avail {
     };
     $meminfo{uc 'MemAvailable'}
 }
+
+sub reportLine($$) {
+    local ($\, $,) = ("\n", "\t");
+    print $_[0], sprintf('%.3f sec', $_[1]->{'end'} - $_[1]->{'start'})
+}
+
+sub processRun($) {
+    my $run = $_[0];
+    $vlog->printf("Processing %s\n", $run);
+
+    my $url = getURL($run);
+    $vlog->printf("URL: %s\n", $url);
+
+    $vlog->printf("Fetching fastq from EBI ...\n");
+    ebiGet($run);
+
+    $vlog->printf("Fetching with ".$config->{NATIVE_TOOL_CMD}." ...\n");
+    nativeGet($url);
+
+    $vlog->printf("Running fasterq-dump without prefetch ...\n");
+    fasterq(0, $run);
+    my $fqd = $times{'fasterq-dump'};
+
+    $vlog->printf("Running prefetch + fasterq-dump ...\n");
+    fasterq(1, $run);
+    $vlog->printf("Generating timing report ...\n");
+
+    print "# Elapsed times for $run\n";
+    reportLine($config->{NATIVE_TOOL_CMD}, $times{'cloud'});
+    reportLine('EBI fastq', $times{'ebi'}) if $times{'ebi'};
+    reportLine('fasterq-dump (no prefetch)', $fqd);
+    reportLine('prefetch', $times{'prefetch'});
+    reportLine('fasterq-dump (after prefetch)', $times{'fasterq-dump'});
+}
+
+sub main {
+    for (0 .. $#ARGV) {
+        my $val = $ARGV[$_];
+        if ($val eq '--') {
+            @fqdParams = splice @ARGV, $_;
+            splice @fqdParams, 0, 1;
+            last;
+        }
+    }
+
+    GetOptions(
+        'v|verbose+' => \$verbose,
+        'n|dryrun' => \$dryRun,
+        'threads=i' => \$threadCount,
+        'temp=s' => \$tempdir,
+        'm|mem=s' => \$mem,
+        'd|disk=s' => \$disk,
+        '<>' => sub {
+            local $_ = shift;
+            local $/ = undef;
+            my $fh = IO::File->new($_, 'r') or goto NOT_A_FILE;
+            push @fromArgv, $_ for (split /\s+/, <$fh>);
+            return;
+        NOT_A_FILE:
+            push @fromArgv, $_;
+        }
+    );
+
+    my $runs = @fromArgv ? \@fromArgv : \@defaultRuns;
+
+    if ($verbose) {
+        my @lines = ();
+
+        $vlog->flush();
+        if ($vlog->getpos) {
+            $vlog->seek(0, 0);
+            @lines = $vlog->getlines;
+        }
+        $vlog->close();
+        undef $vlog;
+        unlink 'verbose.log';
+        $vlog = IO::Handle->new_from_fd(fileno(STDOUT), 'a');
+    }
+
+    $vlog->printf("runs: [ %s ]\n", join(', ', @$runs));
+    $vlog->printf("threads: %u\n", $threadCount);
+    $vlog->printf("memory: %u\n", $mem);
+    $vlog->printf("temp: %s\n", $tempdir);
+    $vlog->printf("temp free space: %s\n", disk_avail($tempdir));
+    $vlog->printf("output: %s\n", $dataDir);
+    $vlog->printf("output space: %s\n", $disk);
+
+    if ($dryRun == 0) {
+        processRun $_ for @$runs;
+    }
+    return 0;
+}
+
+main
